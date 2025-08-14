@@ -1,5 +1,5 @@
+use sqlx::query;
 use sqlx::{PgPool, Postgres, Transaction};
-use sqlx::{query};
 
 #[derive(Debug, Clone)]
 struct NewOrderItem {
@@ -10,21 +10,18 @@ struct NewOrderItem {
 pub async fn ecom_main() -> Result<(), sqlx::Error> {
     let pool = PgPool::connect("postgres://postgres:aniruddha@localhost/learning").await?;
 
-    init_db(&pool).await?;
-    seed_data(&pool).await?;
+    // init_db(&pool).await?;
+    // seed_data(&pool).await?;
 
-    // Example usage of creating a new order
-    let order_items = vec![
-        NewOrderItem {
-            sku: "SKU-USB-C".to_string(),
-            qty: 2,
-        },
-        NewOrderItem {
-            sku: "SKU-KBD-61".to_string(),
-            qty: 1,
-        },
+    // 2) Create an order for customer_id=1 with a few SKUs
+    let items = vec![
+        NewOrderItem { sku: "SKU-USB-C".into(), qty: 2 },
+        NewOrderItem { sku: "SKU-KBD-61".into(), qty: 1 },
     ];
-    
+
+    let order_id = create_order_with_items(&pool, 1, items).await?;
+    println!("\n✅ Created order id = {}\n", order_id);
+
     // Here you would typically create a sales order and add items to it
 
     Ok(())
@@ -133,17 +130,112 @@ async fn create_order_with_items(
     customer_id: i64,
     items: Vec<NewOrderItem>,
 ) -> Result<i64, sqlx::Error> {
-
     let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
 
     // 1) Create the order
-    let order_id: i64 = sqlx::query_scalar(
-        "INSERT INTO sales_order (customer_id) VALUES ($1) RETURNING id",
+    let order_id: i64 =
+        sqlx::query_scalar("INSERT INTO sales_order (customer_id) VALUES ($1) RETURNING id")
+            .bind(customer_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    // 2) For each item:
+    //    - decrement inventory if enough stock (single UPDATE..RETURNING)
+    //    - insert order_item with captured unit price
+    for it in items {
+        // decrement stock and get the current price at the same time
+        let maybe_price: Option<i32> = sqlx::query_scalar(
+            r#"
+            UPDATE inventory
+               SET on_hand = on_hand - $2
+             WHERE sku = $1
+               AND on_hand >= $2
+            RETURNING price_cents
+            "#,
+        )
+        .bind(&it.sku)
+        .bind(it.qty)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let unit_price = match maybe_price {
+            Some(p) => p,
+            None => {
+                // insufficient stock → rollback & error
+                tx.rollback().await?;
+                return Err(sqlx::Error::RowNotFound);
+            }
+        };
+        println!("SKU={} x{} @ ₹{:.2}  ", it.sku, it.qty, (unit_price as f64) / 100.0);
+
+        // insert order_item
+        sqlx::query(
+            r#"
+            INSERT INTO order_item (order_id, sku, qty, unit_price_cents)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(order_id)
+        .bind(&it.sku)
+        .bind(it.qty)
+        .bind(unit_price)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // 3) JOIN **inside the transaction**: compute a summary of the order
+    //    (so if we roll back later, this view would also be rolled back)
+    let (oid, customer_name, total_cents): (i64, String, i64) = sqlx::query_as(
+        r#"
+        SELECT so.id AS order_id,
+               c.name AS customer_name,
+               COALESCE(SUM(oi.qty * oi.unit_price_cents), 0) AS total_cents
+          FROM sales_order so
+          JOIN customer c    ON c.id = so.customer_id
+          LEFT JOIN order_item oi ON oi.order_id = so.id
+         WHERE so.id = $1
+         GROUP BY so.id, c.name
+        "#,
     )
-    .bind(customer_id)
+    .bind(order_id)
     .fetch_one(&mut *tx)
     .await?;
 
+    println!("-- Tx JOIN (order summary) -----------------------------");
+    println!(
+        "order_id={oid}, customer={customer_name}, total=₹{:.2}",
+        (total_cents as f64) / 100.0
+    );
 
-    Ok((12))
- }
+    // 4) JOIN lines: each item joined with inventory to show title + line total
+    let line_rows: Vec<(String, String, i32, i32)> = sqlx::query_as(
+        r#"
+        SELECT oi.sku,
+               i.title,
+               oi.qty,
+               (oi.qty * oi.unit_price_cents) AS line_cents
+          FROM order_item oi
+          JOIN inventory i ON i.sku = oi.sku
+         WHERE oi.order_id = $1
+         ORDER BY i.title
+        "#,
+    )
+    .bind(order_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    println!("-- Tx JOIN (line details) ------------------------------");
+    for (sku, title, qty, line_cents) in line_rows {
+        println!(
+            "{sku:>10}  {:<28}  x{qty:<2}  line=₹{:.2}",
+            title,
+            (line_cents as f64) / 100.0
+        );
+    }
+    println!("--------------------------------------------------------\n");
+
+    // 5) Commit: all changes (order, items, inventory) become visible
+    tx.commit().await?;
+
+    Ok(order_id)
+}
